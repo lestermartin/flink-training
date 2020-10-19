@@ -18,13 +18,13 @@
 
 package org.apache.flink.training.solutions.longrides.scala
 
+import scala.concurrent.duration._
 import org.apache.flink.api.common.state.{ValueState, ValueStateDescriptor}
-import org.apache.flink.api.java.utils.ParameterTool
 import org.apache.flink.streaming.api.TimeCharacteristic
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction
 import org.apache.flink.streaming.api.scala.{StreamExecutionEnvironment, _}
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide
-import org.apache.flink.training.exercises.common.sources.TaxiRideSource
+import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator
 import org.apache.flink.training.exercises.common.utils.ExerciseBase
 import org.apache.flink.training.exercises.common.utils.ExerciseBase._
 import org.apache.flink.util.Collector
@@ -35,19 +35,10 @@ import org.apache.flink.util.Collector
   * The goal for this exercise is to emit START events for taxi rides that have not been matched
   * by an END event during the first 2 hours of the ride.
   *
-  * Parameters:
-  * -input path-to-input-file
   */
 object LongRidesSolution {
 
   def main(args: Array[String]) {
-
-    // parse parameters
-    val params = ParameterTool.fromArgs(args)
-    val input = params.get("input", PATH_TO_RIDE_DATA)
-
-    val maxDelay = 60     // events are out of order by max 60 seconds
-    val speed = 1800      // events of 30 minutes are served every second
 
     // set up the execution environment
     val env = StreamExecutionEnvironment.getExecutionEnvironment
@@ -55,7 +46,7 @@ object LongRidesSolution {
     env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime)
     env.setParallelism(ExerciseBase.parallelism)
 
-    val rides = env.addSource(rideSourceOrTest(new TaxiRideSource(input, maxDelay, speed)))
+    val rides = env.addSource(rideSourceOrTest(new TaxiRideGenerator()))
 
     val longRides = rides
       .keyBy(_.rideId)
@@ -67,39 +58,42 @@ object LongRidesSolution {
   }
 
   class MatchFunction extends KeyedProcessFunction[Long, TaxiRide, TaxiRide] {
-    // keyed, managed state
-    // holds an END event if the ride has ended, otherwise a START event
     lazy val rideState: ValueState[TaxiRide] = getRuntimeContext.getState(
-      new ValueStateDescriptor[TaxiRide]("saved ride", classOf[TaxiRide]))
+      new ValueStateDescriptor[TaxiRide]("ride event", classOf[TaxiRide]))
 
     override def processElement(ride: TaxiRide,
                                 context: KeyedProcessFunction[Long, TaxiRide, TaxiRide]#Context,
                                 out: Collector[TaxiRide]): Unit = {
-      val timerService = context.timerService
 
-      if (ride.isStart) {
-        // the matching END might have arrived first; don't overwrite it
-        if (rideState.value() == null) {
-          rideState.update(ride)
-        }
-      }
-      else {
+      val previousRideEvent = rideState.value()
+
+      if (previousRideEvent == null) {
         rideState.update(ride)
+        if (ride.isStart) {
+          context.timerService().registerEventTimeTimer(getTimerTime(ride))
+        }
+      } else {
+        if (!ride.isStart) {
+          // it's an END event, so event saved was the START event and has a timer
+          // the timer hasn't fired yet, and we can safely kill the timer
+          context.timerService().deleteEventTimeTimer(getTimerTime(previousRideEvent))
+        }
+        // both events have now been seen, we can clear the state
+        rideState.clear()
       }
-
-      timerService.registerEventTimeTimer(ride.getEventTime + 120 * 60 * 1000)
     }
 
     override def onTimer(timestamp: Long,
                          ctx: KeyedProcessFunction[Long, TaxiRide, TaxiRide]#OnTimerContext,
                          out: Collector[TaxiRide]): Unit = {
-      val savedRide = rideState.value
 
-      if (savedRide != null && savedRide.isStart) {
-        out.collect(savedRide)
-      }
-
+      // if we get here, we know that the ride started two hours ago, and the END hasn't been processed
+      out.collect(rideState.value())
       rideState.clear()
+    }
+
+    private def getTimerTime(ride: TaxiRide) = {
+      ride.startTime.toEpochMilli + 2.hours.toMillis
     }
   }
 

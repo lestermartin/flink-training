@@ -19,31 +19,29 @@ under the License.
 
 # Lab: `ProcessFunction` and Timers (Long Ride Alerts)
 
-The goal of the "Long Ride Alerts" exercise is to indicate whenever a taxi ride started two hours ago, and is still ongoing.
+The goal of the "Long Ride Alerts" exercise is to provide a real-time warning whenever a taxi ride
+started two hours ago, and is still ongoing.
+
+This should be done using the event time timestamps and watermarks that are provided in the data stream. 
+
+The stream is out-of-order, and it is possible that the END event for a ride will be processed before
+its START event. But in such cases, we never care to create an alert, since we do know that the ride
+has ended.
 
 ### Input Data
 
-The input data of this exercise is a `DataStream` of taxi ride events. You will want to use a `TaxiRideSource`, as described in the page about the [Taxi Data Stream](../README.md#using-the-taxi-data-streams).
-
-You can filter the events to only include rides within New York City (as is done in the [Taxi Ride Cleansing exercise](../ride-cleansing)), but it is not essential for this lab.
+The input data of this exercise is a `DataStream` of taxi ride events.
 
 ### Expected Output
 
-The result of the exercise should be a `DataStream<TaxiRide>` that only contains START events of taxi rides which have no matching END event within the first two hours of the ride.
+The goal of this exercise is _not_ to find all rides that lasted for more than two hours, but rather
+to create an alert _in real time_ at the moment it becomes known that a ride has been going on for
+more than two hours.
+
+The result of the exercise should be a `DataStream<TaxiRide>` that only contains START events of
+taxi rides that started two hours earlier, and whose END event hasn't yet arrived.
 
 The resulting stream should be printed to standard out.
-
-Here are the `rideIds` and start times of the first few rides that go on for more than two hours, but you might want to print other info as well:
-
-~~~
-> 2758,2013-01-01 00:10:13
-> 7575,2013-01-01 00:20:23
-> 22131,2013-01-01 00:47:03
-> 25473,2013-01-01 00:53:10
-> 29907,2013-01-01 01:01:15
-> 30796,2013-01-01 01:03:00
-...
-~~~
 
 ## Getting Started
 
@@ -64,13 +62,25 @@ Here are the `rideIds` and start times of the first few rides that go on for mor
 <details>
 <summary><strong>Overall approach</strong></summary>
 
-This exercise revolves around using a `ProcessFunction` to manage some keyed state and event time timers, and doing so in a way that works even when the END event for a given `rideId` arrives before the START (which will happen). The challenge is figuring out what state to keep, and when to set and clear that state.
+This exercise revolves around using a `ProcessFunction` to manage some keyed state and event time timers, 
+and doing so in a way that works even when the END event for a given `rideId` arrives before the START (which can happen). 
+The challenge is figuring out what state to keep, and when to set and clear that state.
+You will want to use event time timers that fire two hours after an incoming START event, and in the `onTimer()` method, 
+collect START events to the output only if a matching END event hasn't yet arrived.
 </details>
 
 <details>
-<summary><strong>Timers and State</strong></summary>
+<summary><strong>State and timers</strong></summary>
 
-You will want to use event time timers that fire two hours after the incoming events, and in the `onTimer()` method, collect START events to the output only if a matching END event hasn't yet arrived. As for what state to keep, it is enough to remember the "last" event for each `rideId`, where "last" is based on event time and ride type (START vs END &mdash; yes, there are rides where the START and END have the same timestamp), rather than the order in which the events are processed. The `TaxiRide` class implements `Comparable`; feel free to take advantage of that, and be sure to eventually clear any state you create.
+There are many possible solutions for this exercise, but in general it is enough to keep one
+`TaxiRide` in state (one `TaxiRide` for each key, or `rideId`). The approach used in the reference solution is to
+store whichever event arrives first (the START or the END), and if it's a START event,
+create a timer for two hours later. If and when the other event (for the same `rideId`) arrives,
+carefully clean things up.
+
+It is possible to arrange this so that if `onTimer()` is called, you are guaranteed that
+an alert (i.e., the ride kept in state) should be emitted. Writing the code this way conveniently
+puts all of the complex business logic together in one place (in the `processElement()` method).
 </details>
 
 ## Documentation

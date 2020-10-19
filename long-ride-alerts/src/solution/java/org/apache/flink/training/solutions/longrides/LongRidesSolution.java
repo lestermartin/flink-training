@@ -20,15 +20,13 @@ package org.apache.flink.training.solutions.longrides;
 
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
-import org.apache.flink.api.java.utils.ParameterTool;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.TimeCharacteristic;
-import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.training.exercises.common.datatypes.TaxiRide;
-import org.apache.flink.training.exercises.common.sources.TaxiRideSource;
+import org.apache.flink.training.exercises.common.sources.TaxiRideGenerator;
 import org.apache.flink.training.exercises.common.utils.ExerciseBase;
 import org.apache.flink.util.Collector;
 
@@ -38,26 +36,15 @@ import org.apache.flink.util.Collector;
  * <p>The goal for this exercise is to emit START events for taxi rides that have not been matched
  * by an END event during the first 2 hours of the ride.
  *
- * <p>Parameters:
- * -input path-to-input-file
  */
 public class LongRidesSolution extends ExerciseBase {
 
 	/**
 	 * Main method.
 	 *
-	 * <p>Parameters:
-	 * -input path-to-input-file
-	 *
 	 * @throws Exception which occurs during job execution.
 	 */
 	public static void main(String[] args) throws Exception {
-
-		ParameterTool params = ParameterTool.fromArgs(args);
-		final String input = params.get("input", ExerciseBase.PATH_TO_RIDE_DATA);
-
-		final int maxEventDelay = 60;       // events are out of order by max 60 seconds
-		final int servingSpeedFactor = 600; // events of 10 minutes are served in 1 second
 
 		// set up streaming execution environment
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -65,10 +52,10 @@ public class LongRidesSolution extends ExerciseBase {
 		env.setParallelism(ExerciseBase.parallelism);
 
 		// start the data generator
-		DataStream<TaxiRide> rides = env.addSource(rideSourceOrTest(new TaxiRideSource(input, maxEventDelay, servingSpeedFactor)));
+		DataStream<TaxiRide> rides = env.addSource(rideSourceOrTest(new TaxiRideGenerator()));
 
 		DataStream<TaxiRide> longRides = rides
-				.keyBy(r -> r.rideId)
+				.keyBy((TaxiRide ride) -> ride.rideId)
 				.process(new MatchFunction());
 
 		printOrTest(longRides);
@@ -77,40 +64,46 @@ public class LongRidesSolution extends ExerciseBase {
 	}
 
 	private static class MatchFunction extends KeyedProcessFunction<Long, TaxiRide, TaxiRide> {
-		// keyed, managed state
-		// holds an END event if the ride has ended, otherwise a START event
+
 		private ValueState<TaxiRide> rideState;
 
 		@Override
 		public void open(Configuration config) {
-			ValueStateDescriptor<TaxiRide> startDescriptor =
-					new ValueStateDescriptor<>("saved ride", TaxiRide.class);
-			rideState = getRuntimeContext().getState(startDescriptor);
+			ValueStateDescriptor<TaxiRide> stateDescriptor =
+					new ValueStateDescriptor<>("ride event", TaxiRide.class);
+			rideState = getRuntimeContext().getState(stateDescriptor);
 		}
 
 		@Override
 		public void processElement(TaxiRide ride, Context context, Collector<TaxiRide> out) throws Exception {
-			TimerService timerService = context.timerService();
+			TaxiRide previousRideEvent = rideState.value();
 
-			if (ride.isStart) {
-				// the matching END might have arrived first; don't overwrite it
-				if (rideState.value() == null) {
-					rideState.update(ride);
+			if (previousRideEvent == null) {
+				rideState.update(ride);
+				if (ride.isStart) {
+					context.timerService().registerEventTimeTimer(getTimerTime(ride));
 				}
 			} else {
-				rideState.update(ride);
+				if (!ride.isStart) {
+					// it's an END event, so event saved was the START event and has a timer
+					// the timer hasn't fired yet, and we can safely kill the timer
+					context.timerService().deleteEventTimeTimer(getTimerTime(previousRideEvent));
+				}
+				// both events have now been seen, we can clear the state
+				rideState.clear();
 			}
-
-			timerService.registerEventTimeTimer(ride.getEventTime() + 120 * 60 * 1000);
 		}
 
 		@Override
 		public void onTimer(long timestamp, OnTimerContext context, Collector<TaxiRide> out) throws Exception {
-			TaxiRide savedRide = rideState.value();
-			if (savedRide != null && savedRide.isStart) {
-				out.collect(savedRide);
-			}
+
+			// if we get here, we know that the ride started two hours ago, and the END hasn't been processed
+			out.collect(rideState.value());
 			rideState.clear();
+		}
+
+		private long getTimerTime(TaxiRide ride) {
+			return ride.startTime.plusSeconds(120 * 60).toEpochMilli();
 		}
 	}
 
